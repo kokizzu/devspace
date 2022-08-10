@@ -1,6 +1,7 @@
 package helm
 
 import (
+	"fmt"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions"
 	"io"
 	"os"
@@ -26,10 +27,16 @@ import (
 
 // Deploy deploys the given deployment with helm
 func (d *DeployConfig) Deploy(ctx devspacecontext.Context, forceDeploy bool) (bool, error) {
-	var (
+	var releaseName string
+	if d.DeploymentConfig.Helm.ReleaseName != "" {
+		releaseName = d.DeploymentConfig.Helm.ReleaseName
+	} else {
 		releaseName = d.DeploymentConfig.Name
-		chartPath   = d.DeploymentConfig.Helm.Chart.Name
-		hash        = ""
+	}
+
+	var (
+		chartPath = d.DeploymentConfig.Helm.Chart.Name
+		hash      = ""
 	)
 
 	releaseNamespace := ctx.KubeClient().Namespace()
@@ -151,9 +158,12 @@ func (d *DeployConfig) Deploy(ctx devspacecontext.Context, forceDeploy bool) (bo
 }
 
 func (d *DeployConfig) internalDeploy(ctx devspacecontext.Context, overwriteValues map[string]interface{}, out io.Writer) (*types.Release, error) {
-	var (
+	var releaseName string
+	if d.DeploymentConfig.Helm.ReleaseName != "" {
+		releaseName = d.DeploymentConfig.Helm.ReleaseName
+	} else {
 		releaseName = d.DeploymentConfig.Name
-	)
+	}
 	releaseNamespace := ctx.KubeClient().Namespace()
 	if d.DeploymentConfig.Namespace != "" {
 		releaseNamespace = d.DeploymentConfig.Namespace
@@ -218,11 +228,10 @@ func (d *DeployConfig) getDeploymentValues(ctx devspacecontext.Context) (bool, m
 	if d.DeploymentConfig.Helm.ValuesFiles != nil {
 		for _, overridePath := range d.DeploymentConfig.Helm.ValuesFiles {
 			overwriteValuesPath := ctx.ResolvePath(overridePath)
-
 			overwriteValuesFromPath := map[string]interface{}{}
 			err = yamlutil.ReadYamlFromFile(overwriteValuesPath, overwriteValuesFromPath)
 			if err != nil {
-				ctx.Log().Warnf("Error reading from chart dev overwrite values %s: %v", overwriteValuesPath, err)
+				return false, nil, fmt.Errorf("error reading from chart dev overwrite values %s: %v", overwriteValuesPath, err)
 			}
 
 			// Replace image names

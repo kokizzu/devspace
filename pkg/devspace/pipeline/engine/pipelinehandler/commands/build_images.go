@@ -2,26 +2,30 @@ package commands
 
 import (
 	"fmt"
+	"github.com/loft-sh/devspace/pkg/util/stringutil"
+	"strings"
+
 	flags "github.com/jessevdk/go-flags"
 	"github.com/loft-sh/devspace/pkg/devspace/build"
 	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
 	"github.com/loft-sh/devspace/pkg/devspace/pipeline/types"
 	"github.com/pkg/errors"
-	"strings"
 )
 
 // BuildImagesOptions describe how images should be build
 type BuildImagesOptions struct {
 	build.Options
 
+	All    bool     `long:"all" description:"Build all images"`
+	Except []string `long:"except" description:"If used with --all, will exclude the following images"`
+
 	Set       []string `long:"set" description:"Set configuration"`
 	SetString []string `long:"set-string" description:"Set configuration as string"`
 	From      []string `long:"from" description:"Reuse an existing configuration"`
 	FromFile  []string `long:"from-file" description:"Reuse an existing configuration from a file"`
-
-	All bool `long:"all" description:"Build all images"`
 }
 
+// BuildImages
 func BuildImages(ctx devspacecontext.Context, pipeline types.Pipeline, args []string) error {
 	ctx.Log().Debugf("build_images %s", strings.Join(args, " "))
 	if ctx.KubeClient() != nil {
@@ -40,12 +44,20 @@ func BuildImages(ctx devspacecontext.Context, pipeline types.Pipeline, args []st
 	}
 
 	if options.All {
-		images := ctx.Config().Config().Images
-		for image := range images {
+		args = []string{}
+		for image := range ctx.Config().Config().Images {
+			if stringutil.Contains(options.Except, image) {
+				continue
+			}
+
+			args = append(args, image)
 			ctx, err = applySetValues(ctx, "images", image, options.Set, options.SetString, options.From, options.FromFile)
 			if err != nil {
 				return err
 			}
+		}
+		if len(args) == 0 {
+			return nil
 		}
 	} else if len(args) > 0 {
 		for _, image := range args {

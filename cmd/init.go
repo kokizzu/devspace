@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"mvdan.cc/sh/v3/expand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -334,64 +335,125 @@ func (cmd *InitCmd) initDevspace(f factory.Factory, configLoader loader.ConfigLo
 		break
 	}
 
-	image := ""
-	for {
-		if !mustAddComponentChart {
-			manifests, err := cmd.render(f, config)
-			if err != nil {
-				return errors.Wrap(err, "error rendering deployment")
-			}
-
-			images, err := parseImages(manifests)
-			if err != nil {
-				return errors.Wrap(err, "error parsing images")
-			}
-
-			if len(images) == 0 {
-				return fmt.Errorf("no images found for the selected deployments")
-			}
-
-			image, err = cmd.log.Question(&survey.QuestionOptions{
-				Question:     "Which image do you want to develop with DevSpace?",
-				DefaultValue: images[0],
-				Options:      images,
-			})
-			if err != nil {
-				return err
-			}
-		}
-
-		err = configureManager.AddImage(imageName, image, projectNamespace+"/"+projectName, cmd.Dockerfile)
-		if err != nil {
-			if err.Error() != "" {
-				cmd.log.Errorf("Error: %s", err.Error())
-			}
-		} else {
-			break
-		}
+	developProject := "I want to develop this project and my current working dir contains the source code"
+	deployProject := "I just want to deploy this project"
+	defaultProjectAction := deployProject
+	if !configureManager.IsRemoteDeployment(imageName) {
+		defaultProjectAction = developProject
+	}
+	developOrDeployProject, err := cmd.log.Question(&survey.QuestionOptions{
+		Question:     "Do you want to develop this project with DevSpace or just deploy it?  [Use arrows to move, type to filter]",
+		Options:      []string{developProject, deployProject},
+		DefaultValue: defaultProjectAction,
+	})
+	if err != nil {
+		return err
 	}
 
-	image = config.Images[imageName].Image
+	image := ""
+	if developOrDeployProject == developProject {
+		for {
+			if !mustAddComponentChart {
+				manifests, err := cmd.render(f, config)
+				if err != nil {
+					return errors.Wrap(err, "error rendering deployment")
+				}
+
+				images, err := parseImages(manifests)
+				if err != nil {
+					return errors.Wrap(err, "error parsing images")
+				}
+
+				imageManual := "Manually enter the image I want to work on"
+				imageSkip := "Skip (do not add dev configuration for any images)"
+				imageAnswer := ""
+
+				if len(images) > 0 {
+					imageAnswer, err = cmd.log.Question(&survey.QuestionOptions{
+						Question:     "Which image do you want to develop with DevSpace?",
+						DefaultValue: images[0],
+						Options:      append(images, []string{imageManual, imageSkip}...),
+					})
+					if err != nil {
+						return err
+					}
+				} else {
+					imageAnswer, err = cmd.log.Question(&survey.QuestionOptions{
+						Question: "Couldn’t find any images in your manifests/helm charts. Do you want to skip this step?",
+						Options:  []string{imageManual, imageSkip},
+					})
+					if err != nil {
+						return err
+					}
+				}
+
+				if imageAnswer == imageSkip {
+					break
+				} else if imageAnswer == imageManual {
+					imageQuestion := "What is the main container image of this project?"
+
+					if selectedDeploymentOption == DeployOptionHelm {
+						imageQuestion = "What is the main container image of this project which is deployed by this Helm chart? (e.g. ecr.io/project/image)"
+					}
+
+					if selectedDeploymentOption == DeployOptionKubectl {
+						imageQuestion = "What is the main container image of this project which is deployed by these manifests? (e.g. ecr.io/project/image)"
+					}
+
+					if selectedDeploymentOption == DeployOptionKustomize {
+						imageQuestion = "What is the main container image of this project which is deployed by this Kustomization? (e.g. ecr.io/project/image)"
+					}
+
+					image, err = cmd.log.Question(&survey.QuestionOptions{
+						Question:          imageQuestion,
+						ValidationMessage: "Please enter a valid container image from a Kubernetes pod (e.g. myregistry.tld/project/image)",
+						ValidationFunc: func(name string) error {
+							_, _, err := dockerfile.GetStrippedDockerImageName(strings.ToLower(name))
+							return err
+						},
+					})
+					if err != nil {
+						return err
+					}
+				} else {
+					image = imageAnswer
+				}
+			}
+
+			err = configureManager.AddImage(imageName, image, projectNamespace+"/"+projectName, cmd.Dockerfile)
+			if err != nil {
+				if err.Error() != "" {
+					cmd.log.Errorf("Error: %s", err.Error())
+				}
+			} else {
+				break
+			}
+		}
+	}
 
 	// Determine app port
 	portString := ""
 
-	// Try to get ports from dockerfile
-	ports, err := dockerfile.GetPorts(config.Images[imageName].Dockerfile)
-	if err == nil {
-		if len(ports) == 1 {
-			portString = strconv.Itoa(ports[0])
-		} else if len(ports) > 1 {
-			portString, err = cmd.log.Question(&survey.QuestionOptions{
-				Question:     "Which port is your application listening on?",
-				DefaultValue: strconv.Itoa(ports[0]),
-			})
-			if err != nil {
-				return err
-			}
+	if len(config.Images) > 0 {
+		image = config.Images[imageName].Image
 
-			if portString == "" {
+		// Try to get ports from dockerfile
+		ports, err := dockerfile.GetPorts(config.Images[imageName].Dockerfile)
+		if err == nil {
+			if len(ports) == 1 {
 				portString = strconv.Itoa(ports[0])
+			} else if len(ports) > 1 {
+				portString, err = cmd.log.Question(&survey.QuestionOptions{
+					Question:     "Which port is your application listening on?",
+					DefaultValue: strconv.Itoa(ports[0]),
+				})
+				if err != nil {
+					return err
+				}
+
+				if portString == "" {
+					portString = strconv.Itoa(ports[0])
+				}
 			}
 		}
 	}
@@ -443,15 +505,14 @@ echo 'Anyone using this project can invoke it via "devspace run migrate-db"'`,
 
 	// Add pipeline: dev
 	config.Pipelines["dev"] = &latest.Pipeline{
-		Run: `
-run_dependencies --all     # 1. Deploy any projects this project needs (see "dependencies")
-create_deployments --all   # 2. Deploy Helm charts and manifests specfied as "deployments"
-start_dev ` + imageName + `                     # 3. Start dev mode "` + imageName + `" (see "dev" section)`,
+		Run: `run_dependencies --all       # 1. Deploy any projects this project needs (see "dependencies")
+create_deployments --all     # 2. Deploy Helm charts and manifests specfied as "deployments"
+start_dev ` + imageName + `                # 3. Start dev mode "` + imageName + `" (see "dev" section)`,
 	}
 
 	// Add pipeline: dev
 	config.Pipelines["deploy"] = &latest.Pipeline{
-		Run: `run_dependencies --all                    # 1. Deploy any projects this project needs (see "dependencies")
+		Run: `run_dependencies --all                            # 1. Deploy any projects this project needs (see "dependencies")
 build_images --all -t $(git describe --always)    # 2. Build, tag (git commit hash) and push all images (see "images")
 create_deployments --all                          # 3. Deploy Helm charts and manifests specfied as "deployments"`,
 	}
@@ -670,9 +731,15 @@ func (cmd *InitCmd) addDevConfig(config *latest.Config, imageName, image string,
 		devConfig.Sync = []*latest.SyncConfig{}
 	}
 
-	devConfig.Sync = append(devConfig.Sync, &latest.SyncConfig{
+	syncConfig := &latest.SyncConfig{
 		Path: "./",
-	})
+	}
+
+	if _, err := os.Stat(".dockerignore"); err == nil {
+		syncConfig.UploadExcludeFile = ".dockerignore"
+	}
+
+	devConfig.Sync = append(devConfig.Sync, syncConfig)
 
 	devConfig.Terminal = &latest.Terminal{
 		Command: "./" + startScriptName,
@@ -717,7 +784,7 @@ func (cmd *InitCmd) render(f factory.Factory, config *latest.Config) (string, er
 	err := loader.Save(renderPath, config)
 	defer os.Remove(renderPath)
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "temp render.yaml")
 	}
 
 	// Use the render command to render it.
@@ -736,8 +803,7 @@ func (cmd *InitCmd) render(f factory.Factory, config *latest.Config) (string, er
 	}
 	err = renderCmd.RunDefault(f)
 	if err != nil {
-		f.GetLog().Debugf("error rendering chart: %v", err)
-		return "", nil
+		return "", errors.Wrap(err, "devspace render")
 	}
 
 	return writer.String(), nil
@@ -793,7 +859,7 @@ func appendToIgnoreFile(ignoreFile, content string) error {
 func getProjectName() (string, string, error) {
 	projectName := ""
 	projectNamespace := ""
-	gitRemote, err := command.Output(context.TODO(), "", "git", "config", "--get", "remote.origin.url")
+	gitRemote, err := command.Output(context.TODO(), "", expand.ListEnviron(os.Environ()...), "git", "config", "--get", "remote.origin.url")
 	if err == nil {
 		sep := "/"
 		projectParts := strings.Split(string(regexp.MustCompile(`^.*?://[^/]+?/([^.]+)(\.git)?`).ReplaceAll(gitRemote, []byte("$1"))), sep)

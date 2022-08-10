@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/loft-sh/devspace/pkg/devspace/pipeline/engine"
 	"io"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -130,7 +131,7 @@ func (e *execHandler) ExecHandler(ctx context.Context, args []string) error {
 
 func (e *execHandler) handlePipelineCommands(ctx context.Context, command string, args []string) (bool, error) {
 	hc := interp.HandlerCtx(ctx)
-	devCtx := e.ctx.WithContext(ctx).WithWorkingDir(hc.Dir)
+	devCtx := e.ctx.WithContext(ctx).WithWorkingDir(hc.Dir).WithEnviron(hc.Env)
 	if e.stdout != nil && e.stderr != nil && e.stdout == hc.Stdout && e.stderr == hc.Stderr {
 		devCtx = devCtx.WithLogger(e.ctx.Log())
 	} else {
@@ -148,6 +149,14 @@ func (e *execHandler) handlePipelineCommands(ctx context.Context, command string
 
 	// resolve pipeline commands
 	pipelineCommand, ok := PipelineCommands[command]
+	if ok {
+		return e.executePipelineCommand(ctx, command, func() error {
+			return pipelineCommand(devCtx, e.pipeline, args)
+		})
+	}
+
+	// resolve internal pipeline commands
+	pipelineCommand, ok = PipelineCommands[strings.TrimPrefix(command, "__")]
 	if ok {
 		return e.executePipelineCommand(ctx, command, func() error {
 			return pipelineCommand(devCtx, e.pipeline, args)
